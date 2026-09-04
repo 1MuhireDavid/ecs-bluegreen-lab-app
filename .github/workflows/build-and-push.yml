@@ -1,15 +1,18 @@
 name: "Build and push container image"
 
-# Tagging strategy (rubric: "consistent and mutable"):
-#   - every successful build on main is pushed under BOTH tags:
-#       sha-<12-char-git-sha>   immutable, for traceability/rollback
-#       latest                  mutable, the ONE tag EventBridge + the
-#                               CodePipeline ECR source action watch as
-#                               "the newest version to deploy"
-#   - the ECR repo itself is ImageTagMutability: MUTABLE (see
-#     ecs-bluegreen-lab-infra/cfn/modules/03-ecr-endpoints.yaml), which is
-#     what makes re-pushing ":latest" on every build valid rather than
-#     rejected.
+# Tagging strategy (rubric: "consistent and immutable"):
+#   - every successful build on main pushes exactly ONE tag:
+#       sha-<12-char-git-sha>   a brand-new, never-reused tag every time
+#   - the ECR repo itself is ImageTagMutability: IMMUTABLE (see
+#     ecs-bluegreen-lab-infra/cfn/modules/03-ecr-endpoints.yaml), which
+#     means re-pushing any existing tag string would be rejected outright
+#     -- so there is no floating ":latest" pointer at all here.
+#   - the deploy pipeline doesn't need one: EventBridge (EcrPushRule in
+#     05-cicd-pipeline.yaml) fires on ANY successful "sha-*" push and
+#     passes the exact image DIGEST that was just pushed into CodePipeline
+#     as a source-revision override, so the pipeline always deploys the
+#     specific image this workflow just built -- see that file's comments,
+#     and https://docs.aws.amazon.com/codepipeline/latest/userguide/pipelines-trigger-source-overrides.html
 on:
   push:
     branches: [main]
@@ -35,14 +38,13 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Compute image tags
+      - name: Compute image tag
         id: tags
         run: |
           SHORT_SHA=$(git rev-parse --short=12 HEAD)
           REPO_URI="${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "sha_tag=$REPO_URI:sha-$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "latest_tag=$REPO_URI:latest" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -57,16 +59,11 @@ jobs:
             APP_VERSION=${{ steps.tags.outputs.short_sha }}
           tags: |
             ${{ steps.tags.outputs.sha_tag }}
-            ${{ steps.tags.outputs.latest_tag }}
 
-      - name: Push immutable sha tag (traceability / rollback target)
+      - name: Push image (this push is what triggers the deploy pipeline)
         run: docker push ${{ steps.tags.outputs.sha_tag }}
-
-      - name: Push mutable latest tag (triggers the deploy pipeline)
-        run: docker push ${{ steps.tags.outputs.latest_tag }}
 
       - name: Summary
         run: |
           echo "### Image pushed" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${{ steps.tags.outputs.sha_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${{ steps.tags.outputs.latest_tag }}\` (deploy trigger)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ steps.tags.outputs.sha_tag }}\` (immutable, deploy trigger)" >> "$GITHUB_STEP_SUMMARY"

@@ -37,19 +37,21 @@ docker run -p 8080:8080 -e APP_OWNER_NAME="Jane Doe" ecsdemo
 curl localhost:8080
 ```
 
-## Image tagging strategy: consistent + mutable
+## Image tagging strategy: consistent and immutable
 
-Every successful build on `main` pushes **two tags** to the same image:
+Every successful build on `main` pushes **exactly one** tag:
+`sha-<12-char-git-sha>`. It's never reused -- a brand-new tag every build.
 
-| Tag | Mutability | Purpose |
-|---|---|---|
-| `sha-<12-char-git-sha>` | immutable identity | traceability, manual rollback target |
-| `latest` | **mutable** | the one tag EventBridge and the CodePipeline ECR source action watch -- always "the newest thing on `main`" |
-
-This only works because the ECR repository itself is created with
-`ImageTagMutability: MUTABLE`
-(`ecs-bluegreen-lab-infra/cfn/modules/03-ecr-endpoints.yaml`); otherwise
-re-pushing `:latest` on every build would be rejected.
+This only works as a deploy trigger because the ECR repository itself is
+created with `ImageTagMutability: IMMUTABLE`
+(`ecs-bluegreen-lab-infra/cfn/modules/03-ecr-endpoints.yaml`), which also
+means there is **no** floating `:latest` pointer for anything to watch.
+Instead, the infra repo's `EcrPushRule` (in `05-cicd-pipeline.yaml`)
+watches for *any* successful push of a `sha-*` tag and passes the exact
+image **digest** that was just pushed into CodePipeline as a
+[source-revision override](https://docs.aws.amazon.com/codepipeline/latest/userguide/pipelines-trigger-source-overrides.html) --
+so the pipeline always deploys the specific image this workflow just
+built, regardless of tag.
 
 ## Why a bootstrap placeholder image
 
@@ -110,14 +112,15 @@ repo's README):
 1. `build-and-push.yml` assumes `AWS_ECR_PUSH_ROLE_ARN` via **OIDC** -- a
    role that (via the `job_workflow_ref` trust condition) only this exact
    workflow file, in this exact repo, can assume.
-2. Builds the image, tags it `sha-<sha>` and `latest`, pushes both.
-3. The `:latest` push fires an `ECR Image Action` event -> the
-   `EcrPushRule` EventBridge rule in the infra stack -> starts
-   `ecs-bluegreen-lab-pipeline`.
-4. CodePipeline reads the new image URI (ECR source action) and this
-   repo's `ecs/appspec.yaml` + `ecs/taskdef.json` (GitHub source action,
-   `DetectChanges: false` so it never self-triggers on an unrelated
-   commit like this README), hands both to CodeDeploy.
+2. Builds the image, tags it `sha-<sha>`, pushes it.
+3. That push fires an `ECR Image Action` event -> the `EcrPushRule`
+   EventBridge rule in the infra stack, which extracts the exact image
+   **digest** from the event and starts `ecs-bluegreen-lab-pipeline` with
+   that digest as a source-revision override.
+4. CodePipeline resolves that exact image (ECR source action, overridden
+   to this digest) and this repo's `ecs/appspec.yaml` + `ecs/taskdef.json`
+   (GitHub source action, `DetectChanges: false` so it never self-triggers
+   on an unrelated commit like this README), hands both to CodeDeploy.
 5. CodeDeploy registers a new task definition revision, spins up "green"
    tasks, waits for them to pass the ALB health check, shifts the
    listener's traffic from "blue" to "green", then terminates the old
